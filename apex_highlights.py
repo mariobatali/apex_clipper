@@ -38,6 +38,7 @@ from scipy.signal import fftconvolve, find_peaks
 
 SAMPLE_RATE = 22050
 TEMPLATE_FILENAME = "knock_template.npy"
+SHIELD_TEMPLATE_FILENAME = "shield_template.npy"
 TEMPLATE_META_FILENAME = "knock_template_meta.json"
 DETECTIONS_FILENAME = "detections.json"
 
@@ -510,12 +511,11 @@ def _print(*args, **kwargs):
 
 # --- Per-video worker (top-level for multiprocessing) -----------------------
 
-def _scan_one_video(video_path, ffmpeg_exe, vis_tmpl_path, audio_tmpl_path,
+def _scan_one_video(video_path, ffmpeg_exe, vis_tmpl_path, audio_templates,
                     audio_threshold, audio_min_gap):
     """
     Scan a single video for knockdowns using visual and/or audio detection.
-    Loads templates from file paths (avoids pickling large arrays).
-    Returns a list of merged detection dicts.
+    audio_templates: dict of {label: path_to_npy} or {label: numpy_array}
     """
     video_hits = []  # (timestamp, confidence, source)
 
@@ -529,15 +529,24 @@ def _scan_one_video(video_path, ffmpeg_exe, vis_tmpl_path, audio_tmpl_path,
                 video_hits.append((ts, conf, 'visual'))
 
     # -- Audio scan --
-    if audio_tmpl_path:
-        template = np.load(audio_tmpl_path)
-        aud_dets = scan_audio_for_knocks(
-            video_path, template, ffmpeg_exe,
-            threshold=audio_threshold,
-            min_gap_s=audio_min_gap
-        )
-        for ts, conf in aud_dets:
-            video_hits.append((ts, conf, 'audio'))
+    if audio_templates:
+        for label, tmpl_data in audio_templates.items():
+            # If passed as path (str), load it. If array, use it.
+            if isinstance(tmpl_data, str):
+                if os.path.exists(tmpl_data):
+                    template = np.load(tmpl_data)
+                else:
+                    continue
+            else:
+                template = tmpl_data
+
+            aud_dets = scan_audio_for_knocks(
+                video_path, template, ffmpeg_exe,
+                threshold=audio_threshold,
+                min_gap_s=audio_min_gap
+            )
+            for ts, conf in aud_dets:
+                video_hits.append((ts, conf, f'audio_{label}'))
 
     # -- Merge & dedup within this video (2s window) --
     video_hits.sort(key=lambda x: x[0])
@@ -580,8 +589,8 @@ Examples:
 
     # Paths
     parser.add_argument('--input-dir', type=str,
-                        default=r'Z:\Apex_replays\Apex Legends',
-                        help='Directory containing .mp4 files')
+                        default='.',
+                        help='Directory containing .mp4 files (default: current dir)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output path (default: <input-dir>/cut/highlights.mp4)')
     parser.add_argument('--file', type=str, default=None,
@@ -618,6 +627,8 @@ Examples:
     # Template
     parser.add_argument('--template', type=str, default=None,
                         help='Path to knock_template.npy')
+    parser.add_argument('--shield-template', type=str, default=None,
+                        help='Path to shield_template.npy')
 
     args = parser.parse_args()
 
@@ -654,17 +665,35 @@ Examples:
 
     # ── LOAD TEMPLATES ──
     # Audio template
-    template_path = args.template or os.path.join(cut_dir, TEMPLATE_FILENAME)
-    template = None
+    # Audio template (Knock)
+    knock_tmpl_path = args.template or os.path.join(cut_dir, TEMPLATE_FILENAME)
+    shield_tmpl_path = args.shield_template or os.path.join(cut_dir, SHIELD_TEMPLATE_FILENAME)
+    
+    audio_templates_to_use = {}
+
     if not args.no_audio:
-        if not os.path.exists(template_path):
-            _print(f"\n[WARN] Knock template not found: {template_path}")
-            _print("  Audio scanning disabled. Using visual detection only.")
-            _print('  To enable audio: python apex_highlights.py --calibrate --file "replay.mp4" --knock-at 45')
-            args.no_audio = True
+        # Load Knock
+        if os.path.exists(knock_tmpl_path):
+            # We don't load the array here for the main process if using workers, 
+            # but we check existence.
+            # actually we do need to load it to print info, or just pass path.
+            # For multiprocessing, passing path is better.
+            audio_templates_to_use['knock'] = knock_tmpl_path
+            _print(f"\n[AUDIO] Knock template found: {knock_tmpl_path}")
         else:
-            template = np.load(template_path)
-            _print(f"\nAudio template: {len(template)} samples ({len(template)/SAMPLE_RATE:.4f}s)")
+             _print(f"\n[WARN] Knock template not found: {knock_tmpl_path}")
+        
+        # Load Shield
+        if os.path.exists(shield_tmpl_path):
+            audio_templates_to_use['shield'] = shield_tmpl_path
+            _print(f"[AUDIO] Shield template found: {shield_tmpl_path}")
+        
+        if not audio_templates_to_use:
+            _print("  No audio templates found. Using visual detection only.")
+            _print('  To calibrate knock:  python apex_highlights.py --calibrate --file "replay.mp4" --knock-at 45')
+            _print('  To calibrate shield: python apex_highlights.py --calibrate --file "replay.mp4" --knock-at 60')
+            _print('                       (Then rename knock_template.npy to shield_template.npy)')
+            args.no_audio = True
 
     # Visual template (KNOCKED DOWN text image)
     visual_template = None
@@ -715,7 +744,7 @@ Examples:
     else:
         # Scan all videos
         run_visual = not args.no_visual
-        run_audio = not args.no_audio and os.path.exists(template_path)
+        run_audio = not args.no_audio and bool(audio_templates_to_use)
 
         scan_modes = []
         if run_visual:
@@ -732,7 +761,7 @@ Examples:
 
         # -- Load visual template as bytes for pickling to workers --
         vis_tmpl_path = os.path.join(cut_dir, VISUAL_TEMPLATE_FILENAME) if run_visual else None
-        audio_tmpl_path = template_path if run_audio else None
+        # audio_templates_to_use matches {label: path} structure we need
 
         num_workers = min(args.workers, len(videos))
         _print(f"Using {num_workers} parallel workers\n")
@@ -744,7 +773,7 @@ Examples:
                 fut = pool.submit(
                     _scan_one_video,
                     video, ffmpeg_exe,
-                    vis_tmpl_path, audio_tmpl_path,
+                    vis_tmpl_path, audio_templates_to_use,
                     args.threshold, args.min_gap
                 )
                 futures[fut] = video
@@ -767,10 +796,13 @@ Examples:
                     _print(f"  [{done_count}/{len(videos)}] {video_name}: ERROR {e}")
 
         elapsed = time.time() - t_start
+        elapsed = time.time() - t_start
         vis_count = sum(1 for d in all_detections if d.get('source') == 'visual')
-        aud_count = sum(1 for d in all_detections if d.get('source') == 'audio')
-        _print(f"\nScanning complete: {len(all_detections)} knocks in {elapsed:.1f}s")
-        _print(f"  Visual: {vis_count}  |  Audio: {aud_count}")
+        aud_knock_count = sum(1 for d in all_detections if d.get('source') == 'audio_knock')
+        aud_shield_count = sum(1 for d in all_detections if d.get('source') == 'audio_shield')
+        
+        _print(f"\nScanning complete: {len(all_detections)} events in {elapsed:.1f}s")
+        _print(f"  Visual: {vis_count} | Knock: {aud_knock_count} | Shield: {aud_shield_count}")
 
         # Cache detections for re-merge
         with open(detections_path, 'w') as f:

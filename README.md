@@ -52,7 +52,17 @@ For the best accuracy, you should **calibrate** the tool with one of your own cl
     python apex_highlights.py --input-dir "C:\Path\To\Your\Apex_Clips"
     ```
 
-### 3. Re-Merging (Changing BPM)
+### 3. Detecting Shield Breaks (Audio)
+You can also detect **shield cracks** (or any other sound)!
+
+1.  Run calibration on a clip with a shield break sound:
+    ```bash
+    python apex_highlights.py --calibrate --file "clip_with_shield_break.mp4" --knock-at 12
+    ```
+2.  Go to the `cut/` folder and **rename** the generated `knock_template.npy` to `shield_template.npy`.
+3.  Run the scan again. The tool automatically looks for `shield_template.npy` and will verify both knocks and shield breaks.
+
+### 4. Re-Merging (Changing BPM)
 Once a scan is complete, detections are saved to `cut/detections.json`. You can re-create the montage with different settings instantly:
 
 ```bash
