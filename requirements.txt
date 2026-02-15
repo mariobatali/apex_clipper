@@ -1,0 +1,6 @@
+numpy
+opencv-python
+librosa
+scipy
+imageio-ffmpeg
+matplotlib
